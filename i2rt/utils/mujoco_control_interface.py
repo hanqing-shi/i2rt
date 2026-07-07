@@ -41,6 +41,25 @@ class Mode(Enum):
     CONTROL = auto()
 
 
+class _HeadlessViewer:
+    """Drop-in stand-in for ``mujoco.viewer.Handle`` when there's no display.
+
+    Only implements the subset of the Handle API that the control loop
+    actually uses (``lock()`` / ``is_running()``) so the same loop body can
+    run with or without a real GLFW window.
+    """
+
+    def __init__(self, stop_event: threading.Event):
+        self._stop_event = stop_event
+        self._lock = threading.Lock()
+
+    def lock(self) -> threading.Lock:
+        return self._lock
+
+    def is_running(self) -> bool:
+        return not self._stop_event.is_set()
+
+
 # Button indicator colours  (inactive → active)
 _BTN_OFF_RGBA = np.array([0.35, 0.35, 0.35, 0.7])
 _BTN_ON_RGBA = np.array([0.1, 0.9, 0.1, 1.0])
@@ -164,6 +183,7 @@ class MujocoControlInterface:
         dt: float = 0.02,
         log: bool = False,
         control_dt: float = 0.005,
+        headless: bool = False,
     ):
         self._robot = robot
         self._ee_site = ee_site
@@ -171,6 +191,7 @@ class MujocoControlInterface:
         self._control_dt = control_dt
         self._mode = Mode.VIS
         self._logging = log
+        self._headless = headless
 
         self._viewer: Optional[mujoco.viewer.Handle] = None
         self._viewer_ready = threading.Event()
@@ -238,8 +259,9 @@ class MujocoControlInterface:
         dt: float = 0.02,
         log: bool = False,
         control_dt: float = 0.005,
+        headless: bool = False,
     ) -> "MujocoControlInterface":
-        return cls(robot, robot.xml_path, ee_site, dt, log=log, control_dt=control_dt)
+        return cls(robot, robot.xml_path, ee_site, dt, log=log, control_dt=control_dt, headless=headless)
 
     # ---- model construction ---------------------------------------------------
 
@@ -688,6 +710,16 @@ class MujocoControlInterface:
             print("[control] Press SPACE to toggle CONTROL mode")
 
         self._stop_event.clear()
+
+        if self._headless:
+            self._viewer = _HeadlessViewer(self._stop_event)
+            self._viewer_ready.set()
+            self._run_control_loop(sync=False)
+            self._viewer = None
+            self._viewer_ready.clear()
+            print("[control] Headless loop stopped")
+            return
+
         with mujoco.viewer.launch_passive(
             self._model,
             self._data,
@@ -696,38 +728,51 @@ class MujocoControlInterface:
             self._viewer = viewer
             self._viewer_ready.set()
             viewer.opt.frame = mujoco.mjtFrame.mjFRAME_SITE
-            if self._is_sim:
-                self._set_marker_color(self._VIS_RGBA)
-                self._mirror_robot()
-                self._sync_mocap_to_ee()
-                self._sync_sliders_to_robot()
-
-            control_thread = threading.Thread(
-                target=self._control_loop,
-                name="mujoco_control",
-                daemon=True,
-            )
-            control_thread.start()
-            try:
-                while viewer.is_running():
-                    with viewer.lock():
-                        self._mirror_robot()
-                        self._update_button_indicators()
-                        if self._mode is Mode.VIS:
-                            self._sync_mocap_to_ee()
-                    if self._logging:
-                        self._log()
-                    viewer.sync()
-                    time.sleep(self._dt)
-            except KeyboardInterrupt:
-                pass
-            finally:
-                self._stop_event.set()
-                control_thread.join(timeout=1.0)
-                self._viewer = None
-                self._viewer_ready.clear()
+            self._run_control_loop(sync=True)
+            self._viewer = None
+            self._viewer_ready.clear()
 
         print("[control] Viewer closed")
+
+    def _run_control_loop(self, sync: bool) -> None:
+        """Seed vis state, start the control thread, and run the vis-sync loop.
+
+        Shared by both the real-viewer and headless paths in :meth:`run` —
+        ``sync`` controls whether ``viewer.sync()`` (real GLFW window redraw)
+        is called each tick.
+        """
+        viewer = self._viewer
+        assert viewer is not None, "_run_control_loop started before viewer was set"
+
+        if self._is_sim:
+            self._set_marker_color(self._VIS_RGBA)
+            self._mirror_robot()
+            self._sync_mocap_to_ee()
+            self._sync_sliders_to_robot()
+
+        control_thread = threading.Thread(
+            target=self._control_loop,
+            name="mujoco_control",
+            daemon=True,
+        )
+        control_thread.start()
+        try:
+            while viewer.is_running():
+                with viewer.lock():
+                    self._mirror_robot()
+                    self._update_button_indicators()
+                    if self._mode is Mode.VIS:
+                        self._sync_mocap_to_ee()
+                if self._logging:
+                    self._log()
+                if sync:
+                    viewer.sync()
+                time.sleep(self._dt)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self._stop_event.set()
+            control_thread.join(timeout=1.0)
 
     def _control_loop(self) -> None:
         """Background loop: slider/mocap → IK → collision → command_joint_pos.

@@ -20,6 +20,7 @@ matches) before trusting absolute directions.
 Usage:
     python examples/control_with_mujoco/control_with_quest3.py --sim
     python examples/control_with_mujoco/control_with_quest3.py --channel can0 --quest-ip 192.168.1.23
+    python examples/control_with_mujoco/control_with_quest3.py --channel can0 --headless
 """
 
 import argparse
@@ -148,6 +149,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dt", type=float, default=0.02, help="Viewer loop timestep (s)")
     parser.add_argument("--quest-ip", type=str, default=None, help="Quest3 IP (omit to use ADB)")
     parser.add_argument("--quest-port", type=int, default=12345)
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run the control loop without opening a MuJoCo/GLFW window (no DISPLAY required)",
+    )
     return parser.parse_args()
 
 
@@ -174,7 +180,7 @@ def main() -> None:
     else:
         site = "grasp_site"
 
-    iface = MujocoControlInterface.from_robot(robot, ee_site=site, dt=args.dt)
+    iface = MujocoControlInterface.from_robot(robot, ee_site=site, dt=args.dt, headless=args.headless)
 
     reader = QuestReader(args.quest_ip, args.quest_port)
     stop_event = threading.Event()

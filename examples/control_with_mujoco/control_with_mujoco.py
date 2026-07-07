@@ -23,6 +23,7 @@ Usage:
     python examples/control_with_mujoco/control_with_mujoco.py --arm big_yam --gripper linear_4310 --sim
     python examples/control_with_mujoco/control_with_mujoco.py --arm no_arm --gripper flexible_4310 --sim
     python examples/control_with_mujoco/control_with_mujoco.py --channel can0
+    python examples/control_with_mujoco/control_with_mujoco.py --channel can0 --headless
 """
 
 import argparse
@@ -363,6 +364,7 @@ def _viewer_worker(
     site_arg: Optional[str],
     dt: float,
     log: bool,
+    headless: bool,
     cmd_queue: mp.Queue,
     meta: Dict[str, Any],
     stop_event: Any,
@@ -381,7 +383,7 @@ def _viewer_worker(
     else:
         site = "grasp_site"
 
-    iface = MujocoControlInterface.from_robot(proxy, ee_site=site, dt=dt, log=log)
+    iface = MujocoControlInterface.from_robot(proxy, ee_site=site, dt=dt, log=log, headless=headless)
     try:
         iface.run()
     except KeyboardInterrupt:
@@ -428,6 +430,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dt", type=float, default=0.02, help="Loop timestep (s)")
     parser.add_argument("--site", type=str, default=None, help="EE site name (auto-detected if omitted)")
     parser.add_argument("--log", action="store_true", help="Log joint state and torques each loop iteration")
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run the control loop without opening a MuJoCo/GLFW window (no DISPLAY required)",
+    )
     return parser.parse_args()
 
 
@@ -456,7 +463,8 @@ def main() -> None:
         raise SystemExit("--gripper cannot be 'no_gripper' when --arm is 'no_arm'")
 
     mp.set_start_method("spawn", force=True)
-    _configure_mac_mjpython_subprocesses()
+    if not args.headless:
+        _configure_mac_mjpython_subprocesses()
 
     cmd_queue: mp.Queue = mp.Queue()
     meta_queue: mp.Queue = mp.Queue(maxsize=1)
@@ -482,7 +490,7 @@ def main() -> None:
     viewer_proc = mp.Process(
         target=_viewer_worker,
         name="viewer_worker",
-        args=(args.gripper, args.site, args.dt, args.log, cmd_queue, meta, stop_event),
+        args=(args.gripper, args.site, args.dt, args.log, args.headless, cmd_queue, meta, stop_event),
     )
     viewer_proc.start()
 
