@@ -173,7 +173,18 @@ class MujocoControlInterface:
         self._logging = log
 
         self._viewer: Optional[mujoco.viewer.Handle] = None
+        self._viewer_ready = threading.Event()
         self._stop_event = threading.Event()
+        # Kinematics.fk/ik mutate shared internal solver state (mink.Configuration),
+        # so any caller besides _control_loop (e.g. an external pose-source thread
+        # calling get_ee_pose()) must serialize through this lock.
+        self._kin_lock = threading.Lock()
+        # Set via set_gripper() by an external driver (e.g. a VR controller thread);
+        # merged into whichever command _control_loop sends next, independent of
+        # slider/mocap state, so it can't starve arm IK the way writing straight
+        # into ctrl[gripper_index] would.
+        self._external_gripper_cmd: Optional[float] = None
+        self._last_sent_gripper: Optional[float] = None
 
         n_dofs = robot.num_dofs()
         robot_info = robot.get_robot_info() if hasattr(robot, "get_robot_info") else {}
@@ -490,7 +501,8 @@ class MujocoControlInterface:
     def _sync_mocap_to_sliders(self) -> None:
         """Update the mocap target to match the FK of the current slider joint values."""
         q = self._robot_cmd_to_qpos(self._cmd_from_sliders())
-        pose = self._kin.fk(q, self._ee_site)
+        with self._kin_lock:
+            pose = self._kin.fk(q, self._ee_site)
         self._data.mocap_pos[self._mocap_id] = pose[:3, 3]
         quat = np.empty(4)
         mujoco.mju_mat2Quat(quat, pose[:3, :3].flatten())
@@ -582,11 +594,49 @@ class MujocoControlInterface:
         )
         print("\033[2J\033[H" + table, flush=True)
 
+    # ---- external pose-source API ----------------------------------------------
+    #
+    # Lets an external input (e.g. a VR controller thread) drive the arm the same
+    # way mouse-dragging the mocap target does: write a pose in, and the existing
+    # _control_loop picks up the change on its next tick and runs IK + collision
+    # check + command_joint_pos. Requires the viewer to be running (call
+    # wait_until_ready() first if starting the driver thread before run()).
+
+    def wait_until_ready(self, timeout: Optional[float] = None) -> bool:
+        """Block until the viewer is constructed and set_target_pose() is usable."""
+        return self._viewer_ready.wait(timeout)
+
+    def get_ee_pose(self) -> np.ndarray:
+        """Return the current end-effector pose (4x4) via FK on the live robot joint positions."""
+        q = self._robot_cmd_to_qpos(self._robot.get_joint_pos())
+        with self._kin_lock:
+            return self._kin.fk(q, self._ee_site)
+
+    def set_target_pose(self, pose: np.ndarray) -> None:
+        """Move the mocap target to *pose* (4x4). No-op if the viewer isn't up yet."""
+        viewer = self._viewer
+        if viewer is None:
+            return
+        quat = np.empty(4)
+        mujoco.mju_mat2Quat(quat, pose[:3, :3].flatten())
+        with viewer.lock():
+            self._data.mocap_pos[self._mocap_id] = pose[:3, 3]
+            self._data.mocap_quat[self._mocap_id] = quat
+
+    def set_gripper(self, value: float) -> None:
+        """Request a gripper command (merged into the next command_joint_pos in _control_loop)."""
+        self._external_gripper_cmd = float(value)
+
     # ---- key callback ---------------------------------------------------------
 
-    def _on_key(self, key: int) -> None:
-        if key != 32:  # SPACE
-            return
+    def toggle_mode(self) -> None:
+        """Toggle between VIS and CONTROL mode.
+
+        Called from the viewer's SPACE key callback, but also safe to call
+        from an external driver thread (e.g. a VR controller button) — it
+        acquires ``viewer.lock()`` itself, same as any other viewer mutation.
+        No-op if the viewer isn't up yet.
+        """
         viewer = self._viewer
         if viewer is None:
             return  # Fired before run() finished setting up — ignore.
@@ -609,6 +659,11 @@ class MujocoControlInterface:
                 elif isinstance(self._robot, MotorChainRobot):
                     self._robot.enter_gravity_comp_idle()
                 print("[control] VIS mode — gravity comp, mirroring robot")
+
+    def _on_key(self, key: int) -> None:
+        if key != 32:  # SPACE
+            return
+        self.toggle_mode()
 
     # ---- main loop ------------------------------------------------------------
 
@@ -639,6 +694,7 @@ class MujocoControlInterface:
             key_callback=self._on_key,
         ) as viewer:
             self._viewer = viewer
+            self._viewer_ready.set()
             viewer.opt.frame = mujoco.mjtFrame.mjFRAME_SITE
             if self._is_sim:
                 self._set_marker_color(self._VIS_RGBA)
@@ -669,6 +725,7 @@ class MujocoControlInterface:
                 self._stop_event.set()
                 control_thread.join(timeout=1.0)
                 self._viewer = None
+                self._viewer_ready.clear()
 
         print("[control] Viewer closed")
 
@@ -701,15 +758,27 @@ class MujocoControlInterface:
             mocap_moved = not np.allclose(mocap_pos_snap, prev_mocap_pos, atol=1e-6) or not np.allclose(
                 mocap_quat_snap, prev_mocap_quat, atol=1e-6
             )
+            # An external gripper command (e.g. a VR trigger) is tracked separately
+            # from sliders_moved/mocap_moved so it never steals the mocap-driven IK
+            # branch below — it's merged into whichever command gets sent this tick.
+            gripper_cmd = self._external_gripper_cmd
+            gripper_changed = (
+                gripper_cmd is not None
+                and self._gripper_index is not None
+                and (self._last_sent_gripper is None or not np.isclose(gripper_cmd, self._last_sent_gripper, atol=1e-4))
+            )
 
             ik_solution: Optional[np.ndarray] = None  # arm-joint IK result
             new_mocap_pos: Optional[np.ndarray] = None
             new_mocap_quat: Optional[np.ndarray] = None
+            gripper_sent = False
 
             if sliders_moved:
                 cmd = self._robot.get_joint_pos().copy()
                 nu = min(len(cmd), self._model.nu)
                 cmd[:nu] = ctrl_snap[:nu]
+                if gripper_changed:
+                    cmd[self._gripper_index] = gripper_cmd
                 n = min(len(cmd), self._nq)
                 if self._has_self_collision(cmd, n):
                     if not self._in_collision:
@@ -717,11 +786,13 @@ class MujocoControlInterface:
                         self._in_collision = True
                 else:
                     self._robot.command_joint_pos(cmd)
+                    gripper_sent = gripper_changed
                     if self._in_collision:
                         print("[control] Collision cleared — commands resumed")
                         self._in_collision = False
                 q = self._robot_cmd_to_qpos(cmd)
-                pose = self._kin.fk(q, self._ee_site)
+                with self._kin_lock:
+                    pose = self._kin.fk(q, self._ee_site)
                 new_mocap_pos = pose[:3, 3].copy()
                 new_mocap_quat = np.empty(4)
                 mujoco.mju_mat2Quat(new_mocap_quat, pose[:3, :3].flatten())
@@ -731,10 +802,13 @@ class MujocoControlInterface:
                 rot = np.empty(9)
                 mujoco.mju_quat2Mat(rot, mocap_quat_snap)
                 target[:3, :3] = rot.reshape(3, 3)
-                ok, ik_q = self._kin.ik(target, self._ee_site, init_q=init_q)
+                with self._kin_lock:
+                    ok, ik_q = self._kin.ik(target, self._ee_site, init_q=init_q)
                 if ok:
                     cmd = self._robot.get_joint_pos().copy()
                     cmd[: self._n_arm] = ik_q[: self._n_arm]
+                    if gripper_changed:
+                        cmd[self._gripper_index] = gripper_cmd
                     n = min(len(cmd), self._nq)
                     if self._has_self_collision(cmd, n):
                         if not self._in_collision:
@@ -742,10 +816,28 @@ class MujocoControlInterface:
                             self._in_collision = True
                     else:
                         self._robot.command_joint_pos(cmd)
+                        gripper_sent = gripper_changed
                         if self._in_collision:
                             print("[control] Collision cleared — commands resumed")
                             self._in_collision = False
                         ik_solution = ik_q
+            elif gripper_changed:
+                cmd = self._robot.get_joint_pos().copy()
+                cmd[self._gripper_index] = gripper_cmd
+                n = min(len(cmd), self._nq)
+                if self._has_self_collision(cmd, n):
+                    if not self._in_collision:
+                        print("[control] Collision detected — command blocked")
+                        self._in_collision = True
+                else:
+                    self._robot.command_joint_pos(cmd)
+                    gripper_sent = True
+                    if self._in_collision:
+                        print("[control] Collision cleared — commands resumed")
+                        self._in_collision = False
+
+            if gripper_sent:
+                self._last_sent_gripper = gripper_cmd
 
             with viewer.lock():
                 if ik_solution is not None:

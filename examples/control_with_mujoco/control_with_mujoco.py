@@ -396,6 +396,25 @@ def _viewer_worker(
 # ---------------------------------------------------------------------------
 
 
+def _configure_mac_mjpython_subprocesses() -> None:
+    """Make spawned subprocesses go through the mjpython trampoline.
+
+    mujoco.viewer.launch_passive() on macOS only works in a process that was
+    started via the mjpython launcher (it initializes a module-level
+    dispatcher that routes GUI calls to the real main thread). multiprocessing
+    ignores that launcher and always re-execs plain sys.executable for
+    "spawn" children, so without this the viewer subprocess hits
+    "launch_passive requires mjpython" even though the top-level process was
+    itself launched with mjpython. MJPYTHON_BIN is only set in the
+    environment by the mjpython launcher script itself.
+    """
+    if sys.platform != "darwin" or "MJPYTHON_BIN" not in os.environ:
+        return
+    mjpython = os.path.join(os.path.dirname(sys.executable), "mjpython")
+    if os.access(mjpython, os.X_OK):
+        mp.set_executable(mjpython)
+
+
 def _parse_args() -> argparse.Namespace:
     from i2rt.robots.utils import ArmType, GripperType
 
@@ -437,6 +456,7 @@ def main() -> None:
         raise SystemExit("--gripper cannot be 'no_gripper' when --arm is 'no_arm'")
 
     mp.set_start_method("spawn", force=True)
+    _configure_mac_mjpython_subprocesses()
 
     cmd_queue: mp.Queue = mp.Queue()
     meta_queue: mp.Queue = mp.Queue(maxsize=1)
